@@ -22,7 +22,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "
 import { Type } from "@sinclair/typebox";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
-import TurndownService from "turndown";
+import TurndownService = require("turndown");
 
 // ---------------------------------------------------------------------------
 // Config
@@ -276,16 +276,31 @@ async function parseSSEResponse(response: Response): Promise<any> {
 			return JSON.parse(trimmed);
 		} catch {}
 	}
+
+	const outputItems: any[] = [];
+	let finalResponse: any;
+
 	for (const line of text.split("\n")) {
 		if (!line.startsWith("data: ")) continue;
 		const data = line.slice(6).trim();
 		if (!data || data === "[DONE]") continue;
 		try {
 			const parsed = JSON.parse(data);
-			if (parsed.type === "response.done" || parsed.type === "response.completed") return parsed.response;
+			if (parsed.type === "response.output_item.done" && parsed.item) {
+				outputItems.push(parsed.item);
+				continue;
+			}
+			if (parsed.type === "response.done" || parsed.type === "response.completed") {
+				finalResponse = parsed.response;
+			}
 		} catch {}
 	}
-	throw new Error("Failed to parse OpenAI SSE response");
+
+	if (!finalResponse) throw new Error("Failed to parse OpenAI SSE response");
+	if ((!Array.isArray(finalResponse.output) || finalResponse.output.length === 0) && outputItems.length > 0) {
+		return { ...finalResponse, output: outputItems };
+	}
+	return finalResponse;
 }
 
 function extractSearchResults(responseObj: any): SearchResult[] {
@@ -480,6 +495,7 @@ export const __testables = {
 	extractSearchResults,
 	extractSnippetAround,
 	htmlToMarkdown,
+	openaiWebSearch,
 	parseSSEResponse,
 	resolveAuth,
 	isEnvEnabled,

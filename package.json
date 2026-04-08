@@ -35,6 +35,7 @@
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
     "test": "node --test test/*.test.cjs",
+    "test:live-search": "node --test test/openai-search.live.test.cjs",
     "pack:check": "npm pack --dry-run",
     "release:dry-run": "npm publish --dry-run --access public"
   },

@@ -113,6 +113,25 @@ test('parseSSEResponse returns response from response.done event', async () => {
   assert.deepEqual(parsed, { output: [{ type: 'message' }] });
 });
 
+test('parseSSEResponse reconstructs output from response.output_item.done events', async () => {
+  const sse = [
+    'data: {"type":"response.output_item.done","item":{"type":"web_search_call","action":{"sources":[{"url":"https://example.com"}]}}}',
+    'data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hello","annotations":[]}]}}',
+    'data: {"type":"response.completed","response":{"output":[]}}',
+    'data: [DONE]',
+    '',
+  ].join('\n');
+
+  const resp = new Response(sse, { status: 200 });
+  const parsed = await t.parseSSEResponse(resp);
+  assert.deepEqual(parsed, {
+    output: [
+      { type: 'web_search_call', action: { sources: [{ url: 'https://example.com' }] } },
+      { type: 'message', content: [{ type: 'output_text', text: 'hello', annotations: [] }] },
+    ],
+  });
+});
+
 test('env helpers parse booleans and CSV values', () => {
   process.env.PI_SEARCH_TMP_BOOL = 'false';
   process.env.PI_SEARCH_TMP_CSV = 'a, b ,, c';
