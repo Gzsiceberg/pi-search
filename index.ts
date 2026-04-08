@@ -17,48 +17,12 @@
  * Override: WEBSEARCH_PROVIDER, WEBSEARCH_MODEL env vars
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
-// These are available in pi's jiti runtime
-let truncateHead: any;
-let DEFAULT_MAX_BYTES = 50_000;
-let DEFAULT_MAX_LINES = 2000;
-let formatSize: (bytes: number) => string = (b) => `${(b / 1024).toFixed(1)}KB`;
-
-try {
-	const piAgent = require("@mariozechner/pi-coding-agent");
-	truncateHead = piAgent.truncateHead;
-	DEFAULT_MAX_BYTES = piAgent.DEFAULT_MAX_BYTES ?? 50_000;
-	DEFAULT_MAX_LINES = piAgent.DEFAULT_MAX_LINES ?? 2000;
-	formatSize = piAgent.formatSize ?? formatSize;
-} catch {
-	// Fallback: simple truncation
-	truncateHead = (text: string, opts: { maxLines: number; maxBytes: number }) => {
-		const lines = text.split("\n");
-		const maxLines = opts.maxLines ?? 2000;
-		const maxBytes = opts.maxBytes ?? 50_000;
-		let output = "";
-		let lineCount = 0;
-		for (const line of lines) {
-			if (lineCount >= maxLines || output.length + line.length > maxBytes) {
-				return {
-					content: output,
-					truncated: true,
-					outputLines: lineCount,
-					totalLines: lines.length,
-					outputBytes: output.length,
-					totalBytes: text.length,
-				};
-			}
-			output += (lineCount > 0 ? "\n" : "") + line;
-			lineCount++;
-		}
-		return { content: output, truncated: false, outputLines: lineCount, totalLines: lines.length, outputBytes: output.length, totalBytes: text.length };
-	};
-}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -69,7 +33,29 @@ const DEFAULT_MODELS: Record<string, string> = {
 	openai: "gpt-4o",
 };
 
-const AUTH_PROBE_ORDER = ["openai-codex", "openai"];
+type AuthProvider = "openai-codex" | "openai";
+
+type ResolvedAuth = {
+	provider: AuthProvider;
+	apiKey: string;
+	model: string;
+};
+
+type WebSearchDetails = {
+	query: string;
+	resultCount: number;
+	provider?: AuthProvider;
+	model?: string;
+};
+
+type WebFetchDetails = {
+	url: string;
+	title: string;
+	method: string;
+	linkCount: number;
+};
+
+const AUTH_PROBE_ORDER: readonly AuthProvider[] = ["openai-codex", "openai"];
 
 const FETCH_TIMEOUT_MS = 30_000;
 const SEARCH_TIMEOUT_MS = 60_000;
@@ -86,11 +72,33 @@ const DEFAULT_BLOCKED_WEB_TOOLS = [
 ] as const;
 
 const BASH_WEB_EXECUTABLE_PATTERN = /(?:^|[;&|]\s*)(?:curl|wget|httpie|lynx|w3m|links|xh)(?=\s|$)/i;
-const BASH_WEB_URL_PATTERN = /https?:\/\//i;
+const BASH_WEB_URL_PATTERN = /https?:\/\/[^\s"')]+/gi;
 const BASH_WEB_INLINE_FETCH_PATTERN = /\bnode\s+-e\s+.*fetch\(|\bpython\s+-c\s+.*requests\./i;
+const LOCALHOST_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+function isLocalWebUrl(rawUrl: string): boolean {
+	try {
+		return LOCALHOST_HOSTNAMES.has(new URL(rawUrl).hostname.toLowerCase());
+	} catch {
+		return false;
+	}
+}
+
+function extractWebUrls(command: string): string[] {
+	return Array.from(command.matchAll(BASH_WEB_URL_PATTERN), (match) => match[0]);
+}
 
 function isBashWebAccess(command: string): boolean {
-	return BASH_WEB_EXECUTABLE_PATTERN.test(command) || BASH_WEB_URL_PATTERN.test(command) || BASH_WEB_INLINE_FETCH_PATTERN.test(command);
+	const urls = extractWebUrls(command);
+	const hasRemoteUrl = urls.some((url) => !isLocalWebUrl(url));
+	if (hasRemoteUrl) return true;
+
+	const hasWebExecutable = BASH_WEB_EXECUTABLE_PATTERN.test(command);
+	const hasInlineFetch = BASH_WEB_INLINE_FETCH_PATTERN.test(command);
+	if (!hasWebExecutable && !hasInlineFetch) return false;
+
+	if (urls.length === 0) return true;
+	return false;
 }
 
 // Turndown instance (reused)
@@ -101,7 +109,8 @@ const turndown = new TurndownService({
 });
 
 // Remove images and iframes from markdown output (noise for LLMs)
-turndown.remove(["img", "iframe", "video", "audio", "canvas", "svg"]);
+const removedTags = new Set(["IMG", "IFRAME", "VIDEO", "AUDIO", "CANVAS", "SVG"]);
+turndown.remove((node) => removedTags.has((node as Element).nodeName));
 
 function isEnvEnabled(name: string, defaultValue = true): boolean {
 	const raw = process.env[name];
@@ -134,30 +143,34 @@ function getBlockedWebTools(): Set<string> {
 // Auth resolution
 // ---------------------------------------------------------------------------
 
-async function resolveAuth(ctx: any): Promise<{ provider: string; apiKey: string; model: string } | undefined> {
-	const forced = process.env.WEBSEARCH_PROVIDER?.toLowerCase();
-	if (forced === "openai") {
-		const key = process.env.OPENAI_API_KEY;
-		if (key) return { provider: "openai", apiKey: key, model: process.env.WEBSEARCH_MODEL ?? "gpt-4o" };
-	}
+async function resolveAuth(ctx: Pick<ExtensionContext, "modelRegistry">): Promise<ResolvedAuth | undefined> {
+	const forced = process.env.WEBSEARCH_PROVIDER?.trim().toLowerCase();
+	const providers = AUTH_PROBE_ORDER.filter((providerId) => {
+		if (!forced) return true;
+		return providerId === forced || providerId === `${forced}-codex`;
+	});
 
-	const { getModel } = await import("@mariozechner/pi-ai");
-	for (const providerId of AUTH_PROBE_ORDER) {
-		if (forced && providerId !== forced && providerId !== `${forced}-codex`) continue;
+	for (const providerId of providers) {
 		const modelId = process.env.WEBSEARCH_MODEL ?? DEFAULT_MODELS[providerId];
 		if (!modelId) continue;
-		try {
-			const m = getModel(providerId, modelId);
-			if (m) {
-				const key = await ctx.modelRegistry.getApiKey(m);
-				if (key) return { provider: providerId, apiKey: key, model: modelId };
+
+		const model = ctx.modelRegistry.find(providerId, modelId);
+		if (model) {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (auth.ok && auth.apiKey) {
+				return { provider: providerId, apiKey: auth.apiKey, model: modelId };
 			}
-		} catch {}
+		}
+
+		const providerApiKey = await ctx.modelRegistry.getApiKeyForProvider(providerId);
+		if (providerApiKey) {
+			return { provider: providerId, apiKey: providerApiKey, model: modelId };
+		}
 	}
 
-	if (!forced) {
-		const key = process.env.OPENAI_API_KEY;
-		if (key) return { provider: "openai", apiKey: key, model: process.env.WEBSEARCH_MODEL ?? "gpt-4o" };
+	const envOpenAiKey = process.env.OPENAI_API_KEY;
+	if (envOpenAiKey && (!forced || forced === "openai")) {
+		return { provider: "openai", apiKey: envOpenAiKey, model: process.env.WEBSEARCH_MODEL ?? DEFAULT_MODELS.openai };
 	}
 
 	return undefined;
@@ -194,6 +207,13 @@ function extractAccountId(token: string): string | undefined {
 // ---------------------------------------------------------------------------
 
 type SearchResult = { title: string; url: string; snippet: string };
+
+function textResult<TDetails>(text: string, details: TDetails): AgentToolResult<TDetails> {
+	return {
+		content: [{ type: "text", text }],
+		details,
+	};
+}
 
 async function openaiWebSearch(query: string, model: string, apiKey: string): Promise<SearchResult[]> {
 	const isOAuth = isCodexJwt(apiKey);
@@ -461,6 +481,7 @@ export const __testables = {
 	extractSnippetAround,
 	htmlToMarkdown,
 	parseSSEResponse,
+	resolveAuth,
 	isEnvEnabled,
 	parseCsvEnv,
 	getBlockedWebTools,
@@ -516,41 +537,46 @@ export default function webBrowseExtension(pi: ExtensionAPI) {
 			query: Type.String({ description: "Search query" }),
 		}),
 
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const query = params.query?.trim();
-			if (!query) return { content: [{ type: "text", text: "Error: empty query." }], isError: true };
+			if (!query) throw new Error("empty query");
 
 			const auth = await resolveAuth(ctx);
 			if (!auth) {
-				return {
-					content: [{ type: "text", text: "Error: No API key. Use /login (Codex) or set OPENAI_API_KEY." }],
-					isError: true,
-				};
+				throw new Error("No API key. Use /login (Codex) or set OPENAI_API_KEY.");
 			}
 
-			onUpdate?.({ content: [{ type: "text", text: `Searching via ${auth.provider}...` }] });
+			onUpdate?.(textResult(`Searching via ${auth.provider}: ${query}`, {
+				query,
+				resultCount: 0,
+				provider: auth.provider,
+				model: auth.model,
+			} satisfies WebSearchDetails));
 
-			try {
-				const results = await openaiWebSearch(query, auth.model, auth.apiKey);
-				if (results.length === 0) {
-					return { content: [{ type: "text", text: `No results found for: "${query}"` }] };
-				}
-
-				const formatted = results
-					.map((r, i) => {
-						let entry = `${i + 1}. ${r.title}\n   ${r.url}`;
-						if (r.snippet) entry += `\n   ${r.snippet}`;
-						return entry;
-					})
-					.join("\n\n");
-
-				return {
-					content: [{ type: "text", text: formatted }],
-					details: { query, resultCount: results.length },
-				};
-			} catch (err: any) {
-				return { content: [{ type: "text", text: `Search failed: ${err.message ?? err}` }], isError: true };
+			const results = await openaiWebSearch(query, auth.model, auth.apiKey);
+			if (results.length === 0) {
+				return textResult(`No results found for: "${query}"`, {
+					query,
+					resultCount: 0,
+					provider: auth.provider,
+					model: auth.model,
+				} satisfies WebSearchDetails);
 			}
+
+			const formatted = results
+				.map((r, i) => {
+					let entry = `${i + 1}. ${r.title}\n   ${r.url}`;
+					if (r.snippet) entry += `\n   ${r.snippet}`;
+					return entry;
+				})
+				.join("\n\n");
+
+			return textResult(formatted, {
+				query,
+				resultCount: results.length,
+				provider: auth.provider,
+				model: auth.model,
+			} satisfies WebSearchDetails);
 		},
 	});
 
@@ -567,52 +593,55 @@ export default function webBrowseExtension(pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, onUpdate) {
 			const url = params.url?.trim();
-			if (!url) return { content: [{ type: "text", text: "Error: empty url." }], isError: true };
+			if (!url) throw new Error("empty url");
 
 			const forcePlaywright = params.playwright ?? false;
 
-			onUpdate?.({ content: [{ type: "text", text: `Fetching ${url}...` }] });
+			onUpdate?.(textResult(`Fetching ${url}...`, {
+				url,
+				title: "",
+				method: forcePlaywright ? "playwright" : "auto",
+				linkCount: 0,
+			} satisfies WebFetchDetails));
 
-			try {
-				const result = await smartFetch(url, forcePlaywright);
+			const result = await smartFetch(url, forcePlaywright);
 
-				// Truncate if needed
-				const truncation = truncateHead(result.markdown, {
-					maxLines: DEFAULT_MAX_LINES,
-					maxBytes: DEFAULT_MAX_BYTES,
-				});
+			// Truncate if needed
+			const truncation = truncateHead(result.markdown, {
+				maxLines: DEFAULT_MAX_LINES,
+				maxBytes: DEFAULT_MAX_BYTES,
+			});
 
-				let output = "";
+			let output = "";
 
-				// Header
-				if (result.title) output += `# ${result.title}\n\n`;
-				output += `Source: ${url}\nExtraction: ${result.method}\n\n---\n\n`;
+			// Header
+			if (result.title) output += `# ${result.title}\n\n`;
+			output += `Source: ${url}\nExtraction: ${result.method}\n\n---\n\n`;
 
-				// Content
-				output += truncation.content;
+			// Content
+			output += truncation.content;
 
-				if (truncation.truncated) {
-					output += `\n\n[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
-					output += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
-				}
-
-				// Links found on page
-				if (result.links.length > 0) {
-					const topLinks = result.links.slice(0, 30);
-					output += `\n\n---\n\nLinks found on page (${result.links.length} total):\n`;
-					output += topLinks.map((l, i) => `${i + 1}. ${l}`).join("\n");
-					if (result.links.length > 30) output += `\n... and ${result.links.length - 30} more`;
-				}
-
-				return {
-					content: [{ type: "text", text: output }],
-					details: { url, title: result.title, method: result.method, linkCount: result.links.length },
-				};
-			} catch (err: any) {
-				return { content: [{ type: "text", text: `Fetch failed: ${err.message ?? err}` }], isError: true };
+			if (truncation.truncated) {
+				output += `\n\n[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
+				output += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`;
 			}
+
+			// Links found on page
+			if (result.links.length > 0) {
+				const topLinks = result.links.slice(0, 30);
+				output += `\n\n---\n\nLinks found on page (${result.links.length} total):\n`;
+				output += topLinks.map((l, i) => `${i + 1}. ${l}`).join("\n");
+				if (result.links.length > 30) output += `\n... and ${result.links.length - 30} more`;
+			}
+
+			return textResult(output, {
+				url,
+				title: result.title,
+				method: result.method,
+				linkCount: result.links.length,
+			} satisfies WebFetchDetails);
 		},
 	});
 }

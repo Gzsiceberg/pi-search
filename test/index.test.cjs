@@ -124,6 +124,91 @@ test('env helpers parse booleans and CSV values', () => {
   delete process.env.PI_SEARCH_TMP_CSV;
 });
 
+test('resolveAuth prefers modelRegistry public APIs for codex/openai auth', async () => {
+  delete process.env.WEBSEARCH_PROVIDER;
+  delete process.env.WEBSEARCH_MODEL;
+  delete process.env.OPENAI_API_KEY;
+
+  const calls = [];
+  const ctx = {
+    modelRegistry: {
+      find(provider, model) {
+        calls.push(['find', provider, model]);
+        return provider === 'openai-codex' ? { provider, id: model } : undefined;
+      },
+      async getApiKeyAndHeaders(model) {
+        calls.push(['getApiKeyAndHeaders', model.provider, model.id]);
+        return { ok: true, apiKey: 'codex-oauth-token' };
+      },
+      async getApiKeyForProvider(provider) {
+        calls.push(['getApiKeyForProvider', provider]);
+        return undefined;
+      },
+    },
+  };
+
+  const auth = await t.resolveAuth(ctx);
+  assert.deepEqual(auth, {
+    provider: 'openai-codex',
+    apiKey: 'codex-oauth-token',
+    model: 'gpt-5.2',
+  });
+  assert.deepEqual(calls.slice(0, 2), [
+    ['find', 'openai-codex', 'gpt-5.2'],
+    ['getApiKeyAndHeaders', 'openai-codex', 'gpt-5.2'],
+  ]);
+});
+
+test('resolveAuth falls back to provider lookup and OPENAI_API_KEY', async () => {
+  delete process.env.WEBSEARCH_PROVIDER;
+  delete process.env.WEBSEARCH_MODEL;
+  process.env.OPENAI_API_KEY = 'env-openai-key';
+
+  const ctx = {
+    modelRegistry: {
+      find() {
+        return undefined;
+      },
+      async getApiKeyAndHeaders() {
+        return { ok: false, error: 'no auth' };
+      },
+      async getApiKeyForProvider(provider) {
+        return provider === 'openai-codex' ? 'provider-codex-key' : undefined;
+      },
+    },
+  };
+
+  const codexAuth = await t.resolveAuth(ctx);
+  assert.deepEqual(codexAuth, {
+    provider: 'openai-codex',
+    apiKey: 'provider-codex-key',
+    model: 'gpt-5.2',
+  });
+
+  process.env.WEBSEARCH_PROVIDER = 'openai';
+  const openAiAuth = await t.resolveAuth({
+    modelRegistry: {
+      find() {
+        return undefined;
+      },
+      async getApiKeyAndHeaders() {
+        return { ok: false, error: 'no auth' };
+      },
+      async getApiKeyForProvider() {
+        return undefined;
+      },
+    },
+  });
+  assert.deepEqual(openAiAuth, {
+    provider: 'openai',
+    apiKey: 'env-openai-key',
+    model: 'gpt-4o',
+  });
+
+  delete process.env.WEBSEARCH_PROVIDER;
+  delete process.env.OPENAI_API_KEY;
+});
+
 test('getBlockedWebTools keeps web_search/web_fetch unblocked', () => {
   process.env.PI_SEARCH_EXTRA_BLOCKED_TOOLS = 'web_search,web_fetch,custom_tool';
   process.env.PI_SEARCH_ALLOWED_WEB_TOOLS = 'mcp_fetch';
@@ -136,6 +221,19 @@ test('getBlockedWebTools keeps web_search/web_fetch unblocked', () => {
 
   delete process.env.PI_SEARCH_EXTRA_BLOCKED_TOOLS;
   delete process.env.PI_SEARCH_ALLOWED_WEB_TOOLS;
+});
+
+test('isBashWebAccess allows localhost and 127.0.0.1 URLs', () => {
+  assert.equal(t.isBashWebAccess('curl http://localhost:3000/healthz'), false);
+  assert.equal(t.isBashWebAccess('wget http://127.0.0.1:8080/status'), false);
+  assert.equal(t.isBashWebAccess('curl http://[::1]:4000/ready'), false);
+});
+
+test('isBashWebAccess still blocks remote URLs and ambiguous web commands', () => {
+  assert.equal(t.isBashWebAccess('curl https://example.com'), true);
+  assert.equal(t.isBashWebAccess('wget http://example.com/file.txt'), true);
+  assert.equal(t.isBashWebAccess('curl --help'), true);
+  assert.equal(t.isBashWebAccess('node -e "fetch(\'https://example.com\')"'), true);
 });
 
 function makePiStub() {

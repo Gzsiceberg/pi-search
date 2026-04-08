@@ -32,6 +32,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && esbuild index.ts --platform=node --format=cjs --outfile=dist/index.js --packages=external",
+    "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
     "test": "node --test test/*.test.cjs",
     "pack:check": "npm pack --dry-run",
@@ -43,7 +44,7 @@
     "turndown": "^7.2.0"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.54.2",
+    "@mariozechner/pi-coding-agent": "^0.65.2",
     "@sinclair/typebox": "^0.34.48"
   },
   "optionalDependencies": {
@@ -51,8 +52,10 @@
   },
   "devDependencies": {
     "@sinclair/typebox": "^0.34.48",
+    "@types/turndown": "^5.0.5",
     "esbuild": "^0.25.9",
-    "jiti": "^2.4.2"
+    "jiti": "^2.4.2",
+    "typescript": "^5.9.3"
   },
   "publishConfig": {
     "access": "public"
